@@ -133,17 +133,25 @@ fn test_rsa_rumqttd_broker_compatibility() {
     })
     .instrument(tracing::info_span!("client"));
 
-    // info!("Waiting for server to complete");
-    // server_handle
-    //     .into_inner()
-    //     .join()
-    //     .expect("Failed to join the broker thread");
-
     info!("Waiting for client to complete");
     client_thread
         .into_inner()
         .join()
         .expect("Failed to join the client thread");
+
+    // FIXME: Neither of these work.
+    //        I must be doing the server event loop "return" statement wrong.
+    //        However, TLS is still being established, meeting the goal of this test.
+    // info!("Waiting for server event loop to complete");
+    // server_event_loop
+    //     .into_inner()
+    //     .join()
+    //     .expect("Failed to join the broker event loop thread");
+    // info!("Waiting for server to complete");
+    // server_handle
+    //     .into_inner()
+    //     .join()
+    //     .expect("Failed to join the broker thread");
 }
 
 fn log_info() {
