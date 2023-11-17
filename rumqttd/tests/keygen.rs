@@ -17,10 +17,24 @@ use tempdir::TempDir;
  *       TLS configurations of this MQTT broker and client
  */
 
-/// Generate a key pair (i.e., private key and CSR) for the client or server
+/// Generate an RSA key pair (i.e., private key and CSR) for the client or server
 pub fn openssl_rsa_key_pair(is_server: bool) -> Result<(PKey<Private>, X509Req), Box<dyn Error>> {
     let private_key = generate_rsa_private_pkey()?;
+    let req = generate_key_pair_from_pkey(is_server, &private_key)?;
+    Ok((private_key, req))
+}
 
+/// Generate an ECC key pair (i.e., private key and CSR) for the client or server
+pub fn openssl_ecc_key_pair(is_server: bool) -> Result<(PKey<Private>, X509Req), Box<dyn Error>> {
+    let private_key = generate_ec_private_pkey()?;
+    let req = generate_key_pair_from_pkey(is_server, &private_key)?;
+    Ok((private_key, req))
+}
+
+fn generate_key_pair_from_pkey(
+    is_server: bool,
+    private_key: &PKey<Private>,
+) -> Result<X509Req, Box<dyn Error>> {
     let name = rumqtt_x509_name();
 
     let mut req_builder = X509ReqBuilder::new()?;
@@ -82,8 +96,7 @@ pub fn openssl_rsa_key_pair(is_server: bool) -> Result<(PKey<Private>, X509Req),
     }
 
     let req = req_builder.build();
-
-    Ok((private_key, req))
+    Ok(req)
 }
 
 fn generate_rsa_private_pkey() -> Result<PKey<Private>, Box<dyn Error>> {
@@ -353,6 +366,50 @@ fn generate_signed_key_pair(
     // 1. Generate the client or server key and CSR
     let (client_private_key, csr) =
         openssl_rsa_key_pair(is_server).expect("Failed to generate key pair");
+
+    // 2. sign the CSR with the CA
+    let client_signed_cert =
+        sign_csr_with_ca(&ca_x509_cert, &ca_private_key, &csr).expect("Failed to sign CSR");
+    (client_private_key, client_signed_cert)
+}
+
+pub(crate) fn provide_broker_crypto_ecc() -> (
+    /* certificate authority*/
+    PKey<Private>,
+    X509,
+    /* client */
+    PKey<Private>,
+    X509,
+    /* server */
+    PKey<Private>,
+    X509,
+) {
+    let (ca_x509_cert, ca_private_key) = openssl_ecc_ca().expect("Failed to generate CA");
+
+    // Generate signed key pairs for client and server
+    let (client_private_key, client_signed_cert) =
+        generate_signed_key_pair_ecc(&ca_private_key, &ca_x509_cert, false);
+    let (server_private_key, server_signed_cert) =
+        generate_signed_key_pair_ecc(&ca_private_key, &ca_x509_cert, true);
+
+    (
+        ca_private_key,
+        ca_x509_cert,
+        client_private_key,
+        client_signed_cert,
+        server_private_key,
+        server_signed_cert,
+    )
+}
+
+fn generate_signed_key_pair_ecc(
+    ca_private_key: &PKey<Private>,
+    ca_x509_cert: &X509,
+    is_server: bool,
+) -> (PKey<Private>, X509) {
+    // 1. Generate the client or server key and CSR
+    let (client_private_key, csr) =
+        openssl_ecc_key_pair(is_server).expect("Failed to generate key pair");
 
     // 2. sign the CSR with the CA
     let client_signed_cert =
