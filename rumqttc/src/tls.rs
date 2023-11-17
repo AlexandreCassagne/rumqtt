@@ -1,4 +1,17 @@
 #[cfg(feature = "use-rustls")]
+use std::convert::TryFrom;
+use std::io;
+#[cfg(feature = "use-rustls")]
+use std::io::{BufReader, Cursor};
+use std::net::AddrParseError;
+#[cfg(feature = "use-rustls")]
+use std::sync::Arc;
+
+#[cfg(feature = "use-native-tls")]
+use tokio_native_tls::native_tls::{Error as NativeTlsError, Identity};
+#[cfg(feature = "use-native-tls")]
+use tokio_native_tls::TlsConnector as NativeTlsConnector;
+#[cfg(feature = "use-rustls")]
 use tokio_rustls::rustls;
 #[cfg(feature = "use-rustls")]
 use tokio_rustls::rustls::client::InvalidDnsNameError;
@@ -9,26 +22,10 @@ use tokio_rustls::rustls::{
 #[cfg(feature = "use-rustls")]
 use tokio_rustls::TlsConnector as RustlsConnector;
 
+use crate::framed::N;
 #[cfg(feature = "use-rustls")]
 use crate::Key;
-#[cfg(feature = "use-rustls")]
-use std::convert::TryFrom;
-#[cfg(feature = "use-rustls")]
-use std::io::{BufReader, Cursor};
-#[cfg(feature = "use-rustls")]
-use std::sync::Arc;
-
-use crate::framed::N;
 use crate::TlsConfiguration;
-
-#[cfg(feature = "use-native-tls")]
-use tokio_native_tls::TlsConnector as NativeTlsConnector;
-
-#[cfg(feature = "use-native-tls")]
-use tokio_native_tls::native_tls::{Error as NativeTlsError, Identity};
-
-use std::io;
-use std::net::AddrParseError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -107,9 +104,36 @@ pub async fn rustls_connector(tls_config: &TlsConfiguration) -> Result<RustlsCon
                 // load appropriate Key as per the user request. The underlying signature algorithm
                 // of key generation determines the Signature Algorithm during the TLS Handskahe.
                 let read_keys = match &client.1 {
-                    Key::RSA(k) => rustls_pemfile::rsa_private_keys(&mut BufReader::new(
-                        Cursor::new(k.clone()),
-                    )),
+                    Key::RSA(k) => {
+                        // Try to read the key as PKCS8, if none are present, try to read it as RSA
+                        // Note: It should be ok to unwrap the values even if they are absent per rustls_pemfile docs:
+                        //   > This function does not fail if there are no keys in the file -- it returns an empty vector.
+                        let pkcs8_interpretation = rustls_pemfile::pkcs8_private_keys(
+                            &mut BufReader::new(Cursor::new(k.clone())),
+                        );
+                        if pkcs8_interpretation.is_ok() {
+                            let pkcs8_interpretation = pkcs8_interpretation.unwrap();
+                            if pkcs8_interpretation.len() > 0 {
+                                Ok(pkcs8_interpretation)
+                            } else {
+                                let rsa_interpretation = rustls_pemfile::rsa_private_keys(
+                                    &mut BufReader::new(Cursor::new(k)),
+                                );
+                                if rsa_interpretation.is_ok() {
+                                    let rsa_interpretation = rsa_interpretation.unwrap();
+                                    if rsa_interpretation.len() > 0 {
+                                        Ok(rsa_interpretation)
+                                    } else {
+                                        return Err(Error::NoValidCertInChain);
+                                    }
+                                } else {
+                                    rsa_interpretation
+                                }
+                            }
+                        } else {
+                            pkcs8_interpretation
+                        }
+                    }
                     Key::ECC(k) => rustls_pemfile::pkcs8_private_keys(&mut BufReader::new(
                         Cursor::new(k.clone()),
                     )),
