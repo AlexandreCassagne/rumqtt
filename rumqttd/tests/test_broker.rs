@@ -5,7 +5,8 @@ use rumqttd::{Broker, ServerSettings};
 use std::collections::HashMap;
 use tempdir::TempDir;
 
-pub fn start_rsa_broker(temp_dir: &TempDir) -> (PKey<Private>, X509, Vec<u8>, Broker) {
+/// Utility method to start a broker with RSA crypto. Returns the client private key, client signed cert, CA cert, and the broker.
+pub fn make_rsa_broker(temp_dir: &TempDir) -> (PKey<Private>, X509, Vec<u8>, Broker) {
     /* I: Certificate Authority */
     let (
         ca_private_key,

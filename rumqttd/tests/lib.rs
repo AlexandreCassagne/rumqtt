@@ -23,7 +23,7 @@ fn test_rsa_rumqttd_broker_compatibility() {
 
     info!("Directory = {:?}", dir.path().to_path_buf().to_str());
     let (client_private_key, client_signed_cert, ca_x509_cert_pem, mut broker) =
-        test_broker::start_rsa_broker(dir.as_ref());
+        test_broker::make_rsa_broker(dir.as_ref());
 
     let (mut link_tx, mut link_rx) = broker.link("v4-1").unwrap();
     info!("Link created");
