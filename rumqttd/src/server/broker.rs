@@ -1,21 +1,8 @@
-use crate::link::alerts::{self};
-use crate::link::console::ConsoleLink;
-use crate::link::network::{self, Network, N};
-use crate::link::remote::{self, mqtt_connect, RemoteLink};
-use crate::link::{bridge, timer};
-use crate::local::LinkBuilder;
-use crate::protocol::v4::V4;
-use crate::protocol::v5::V5;
-use crate::protocol::{Packet, Protocol};
-#[cfg(any(feature = "use-rustls", feature = "use-native-tls"))]
-use crate::server::tls::{self, TLSAcceptor};
-use crate::{meters, ConnectionSettings, Meter};
-use flume::{RecvError, SendError, Sender};
+use std::{io, thread};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
-use tracing::{error, field, info, warn, Instrument};
-use uuid::Uuid;
+use std::time::Duration;
 
 #[cfg(feature = "websocket")]
 use async_tungstenite::tokio::accept_hdr_async;
@@ -25,22 +12,33 @@ use async_tungstenite::tungstenite::handshake::server::{
 };
 #[cfg(feature = "websocket")]
 use async_tungstenite::tungstenite::http::HeaderValue;
+use flume::{RecvError, Sender, SendError};
+use metrics::gauge;
+use metrics_exporter_prometheus::PrometheusBuilder;
+use tokio::{task, time};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::time::error::Elapsed;
+use tracing::{error, field, info, Instrument, warn};
+use uuid::Uuid;
 #[cfg(feature = "websocket")]
 use ws_stream_tungstenite::WsStream;
 
-use metrics::gauge;
-use metrics_exporter_prometheus::PrometheusBuilder;
-use std::time::Duration;
-use std::{io, thread};
-
-use crate::link::console;
-use crate::link::local::{self, LinkRx, LinkTx};
-use crate::router::{Event, Router};
+use crate::{ConnectionSettings, Meter, meters};
 use crate::{Config, ConnectionId, ServerSettings};
-
-use tokio::net::{TcpListener, TcpStream};
-use tokio::time::error::Elapsed;
-use tokio::{task, time};
+use crate::link::{bridge, timer};
+use crate::link::alerts::{self};
+use crate::link::console;
+use crate::link::console::ConsoleLink;
+use crate::link::local::{self, LinkRx, LinkTx};
+use crate::link::network::{self, N, Network};
+use crate::link::remote::{self, mqtt_connect, RemoteLink};
+use crate::local::LinkBuilder;
+use crate::protocol::{Packet, Protocol};
+use crate::protocol::v4::V4;
+use crate::protocol::v5::V5;
+use crate::router::{Event, Router};
+#[cfg(any(feature = "use-rustls", feature = "use-native-tls"))]
+use crate::server::tls::{self, TLSAcceptor};
 
 #[derive(Debug, thiserror::Error)]
 #[error("Acceptor error")]
@@ -470,6 +468,7 @@ impl<P: Protocol + Clone + Send + 'static> Server<P> {
 /// by adding the "sec-websocket-protocol" with value of "mqtt" to the response header
 #[cfg(feature = "websocket")]
 struct WSCallback;
+
 #[cfg(feature = "websocket")]
 impl Callback for WSCallback {
     fn on_request(
@@ -509,7 +508,7 @@ async fn remote<P: Protocol>(
     let connect_packet = match mqtt_connect(config, &mut network).await {
         Ok(p) => p,
         Err(e) => {
-            error!(error=?e, "Error while handling MQTT connect packet");
+            error!(error=?e, "Error while handling MQTT connect packet: {:?}", e);
             return;
         }
     };
