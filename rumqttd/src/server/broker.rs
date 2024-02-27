@@ -1,20 +1,8 @@
-use crate::link::alerts::{self};
-use crate::link::console::ConsoleLink;
-use crate::link::network::{Network, N};
-use crate::link::remote::{self, mqtt_connect, RemoteLink};
-use crate::link::{bridge, timer};
-use crate::local::LinkBuilder;
-use crate::protocol::v4::V4;
-use crate::protocol::v5::V5;
-use crate::protocol::{Packet, Protocol};
-#[cfg(any(feature = "use-rustls", feature = "use-native-tls"))]
-use crate::server::tls::{self, TLSAcceptor};
-use crate::{meters, ConnectionSettings, Meter};
-use flume::{RecvError, SendError, Sender};
+use std::{io, thread};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::{Arc, Mutex};
-use tracing::{error, field, info, warn, Instrument};
+use std::sync::Arc;
+use std::time::Duration;
 
 #[cfg(feature = "websocket")]
 use async_tungstenite::tokio::accept_hdr_async;
@@ -24,21 +12,34 @@ use async_tungstenite::tungstenite::handshake::server::{
 };
 #[cfg(feature = "websocket")]
 use async_tungstenite::tungstenite::http::HeaderValue;
+use flume::{RecvError, Sender, SendError};
+use futures_util::TryFutureExt;
+use metrics::register_gauge;
+use metrics_exporter_prometheus::PrometheusBuilder;
+use parking_lot::Mutex;
+use tokio::{task, time};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::time::error::Elapsed;
+use tracing::{debug, error, field, info, Instrument, trace, warn};
 #[cfg(feature = "websocket")]
 use ws_stream_tungstenite::WsStream;
 
-use metrics::register_gauge;
-use metrics_exporter_prometheus::PrometheusBuilder;
-use std::time::Duration;
-use std::{io, thread};
-
-use crate::link::console;
-use crate::link::local::{self, LinkRx, LinkTx};
-use crate::router::{Event, Router};
+use crate::{ConnectionSettings, Meter, meters};
 use crate::{Config, ConnectionId, ServerSettings};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::time::error::Elapsed;
-use tokio::{task, time};
+use crate::link::{bridge, timer};
+use crate::link::alerts::{self};
+use crate::link::console;
+use crate::link::console::ConsoleLink;
+use crate::link::local::{self, LinkRx, LinkTx};
+use crate::link::network::{N, Network};
+use crate::link::remote::{self, mqtt_connect, RemoteLink};
+use crate::local::LinkBuilder;
+use crate::protocol::{Packet, Protocol};
+use crate::protocol::v4::V4;
+use crate::protocol::v5::V5;
+use crate::router::{Event, Router};
+#[cfg(any(feature = "use-rustls", feature = "use-native-tls"))]
+use crate::server::tls::{self, TLSAcceptor};
 
 #[derive(Debug, thiserror::Error)]
 #[error("Acceptor error")]
@@ -368,7 +369,14 @@ impl<P: Protocol + Clone + Send + 'static> Server<P> {
         #[cfg(any(feature = "use-rustls", feature = "use-native-tls"))]
         match &self.config.tls {
             Some(c) => {
-                let (tenant_id, network) = TLSAcceptor::new(c)?.accept(stream).await?;
+                let peer_addr = stream.peer_addr()?.clone();
+                info!("Accepting TLS connection: {:?}", peer_addr);
+                let tls_acceptor = TLSAcceptor::new(c)?;
+                let (tenant_id, network) = tls_acceptor.accept(stream).await?;
+                info!(
+                    "TLS connection accepted for tenant and peer: {:?} - {:?}",
+                    tenant_id, peer_addr
+                );
                 Ok((network, tenant_id))
             }
             None => Ok((Box::new(stream), None)),
@@ -401,7 +409,7 @@ impl<P: Protocol + Clone + Send + 'static> Server<P> {
             let (network, tenant_id) = match self.tls_accept(stream).await {
                 Ok(o) => o,
                 Err(e) => {
-                    error!(error=?e, "Tls accept error");
+                    error!(error=?e, "Tls accept error: {:?}", e);
                     continue;
                 }
             };
@@ -415,6 +423,7 @@ impl<P: Protocol + Clone + Send + 'static> Server<P> {
             count += 1;
 
             let protocol = self.protocol.clone();
+
             match link_type {
                 #[cfg(feature = "websocket")]
                 LinkType::Websocket => {
@@ -438,7 +447,8 @@ impl<P: Protocol + Clone + Send + 'static> Server<P> {
                             "websocket_link",
                             client_id = field::Empty,
                             connection_id = field::Empty
-                        )),
+                        ))
+                        .map_err(|err| anyhow::anyhow!("Websocket remote link error: {:?}", err)),
                     )
                 }
                 LinkType::Remote => task::spawn(
@@ -455,7 +465,8 @@ impl<P: Protocol + Clone + Send + 'static> Server<P> {
                         ?tenant_id,
                         client_id = field::Empty,
                         connection_id = field::Empty,
-                    )),
+                    ))
+                    .map_err(|err| anyhow::anyhow!("Remote link error: {:?}", err)),
                 ),
             };
 
@@ -468,6 +479,7 @@ impl<P: Protocol + Clone + Send + 'static> Server<P> {
 /// by adding the "sec-websocket-protocol" with value of "mqtt" to the response header
 #[cfg(feature = "websocket")]
 struct WSCallback;
+
 #[cfg(feature = "websocket")]
 impl Callback for WSCallback {
     fn on_request(
@@ -494,7 +506,8 @@ async fn remote<P: Protocol>(
     stream: Box<dyn N>,
     protocol: P,
     will_handlers: Arc<Mutex<HashMap<String, Sender<AwaitingWill>>>>,
-) {
+) -> anyhow::Result<()> {
+    info!("Remote connection started for tenant={:?}", tenant_id);
     let mut network = Network::new(
         stream,
         config.max_payload_size,
@@ -507,8 +520,10 @@ async fn remote<P: Protocol>(
     let connect_packet = match mqtt_connect(config, &mut network).await {
         Ok(p) => p,
         Err(e) => {
-            error!(error=?e, "Error while handling MQTT connect packet");
-            return;
+            return Err(anyhow::anyhow!(
+                "Error while handling MQTT connect packet: {:?}",
+                e
+            ));
         }
     };
 
@@ -526,7 +541,13 @@ async fn remote<P: Protocol>(
         client_id = format!("{tenant_id}.{client_id}");
     }
 
-    if let Some(sender) = will_handlers.lock().unwrap().remove(&client_id) {
+    const TIMEOUT_DURATION: Duration = Duration::from_secs(10);
+
+    if let Some(sender) = will_handlers
+        .try_lock_for(TIMEOUT_DURATION)
+        .ok_or_else(|| anyhow::anyhow!("Failed to acquire lock for will handlers"))?
+        .remove(&client_id)
+    {
         let awaiting_will = if clean_session {
             AwaitingWill::Fire
         } else {
@@ -537,24 +558,24 @@ async fn remote<P: Protocol>(
 
     let (will_tx, will_rx) = flume::bounded::<AwaitingWill>(1);
     will_handlers
-        .lock()
-        .unwrap()
+        .try_lock_for(TIMEOUT_DURATION)
+        .ok_or_else(|| anyhow::anyhow!("Failed to acquire lock for will handlers"))?
         .insert(client_id.clone(), will_tx);
 
     // Start the link
-    let mut link = match RemoteLink::new(
+    let remote_link = RemoteLink::new(
         router_tx.clone(),
         tenant_id.clone(),
         network,
         connect_packet,
         dynamic_filters,
     )
-    .await
-    {
+    .await;
+
+    let mut link = match remote_link {
         Ok(l) => l,
         Err(e) => {
-            error!(error=?e, "Remote link error");
-            return;
+            return Err(anyhow::anyhow!("Remote link error: {:?}", e));
         }
     };
 
@@ -562,7 +583,10 @@ async fn remote<P: Protocol>(
     let will_delay_interval = link.will_delay_interval;
     let mut send_disconnect = true;
 
-    match link.start().await {
+    let started_link = link.start().await;
+    debug!("Started link for client: {:?}", client_id);
+
+    match started_link {
         // Connection got closed. This shouldn't usually happen.
         Ok(_) => error!("connection-stop"),
         // No need to send a disconnect message when disconnection
@@ -581,33 +605,41 @@ async fn remote<P: Protocol>(
         let disconnect = Event::Disconnect;
         let message = (connection_id, disconnect);
         router_tx.send(message).ok();
+        debug!("Sent disconnect message for client: {:?}", client_id);
     }
 
     // this is important to stop the connection
     drop(link);
 
-    let publish_will = match tokio::time::timeout(
+    let publish_will_result = tokio::time::timeout(
         Duration::from_secs(will_delay_interval as u64),
         will_rx.recv_async(),
     )
-    .await
-    {
+    .await;
+
+    let publish_will = match publish_will_result {
         Ok(w) => w.is_ok_and(|k| k == AwaitingWill::Fire),
         Err(_) => {
             // no need to keep the sender after timeout
-            will_handlers.lock().unwrap().remove(&client_id);
+            will_handlers
+                .try_lock_for(TIMEOUT_DURATION)
+                .ok_or_else(|| anyhow::anyhow!("Failed to acquire lock for will handlers"))?
+                .remove(&client_id);
             // as will delay interval has passed, publish the will message
             true
         }
     };
 
     if publish_will {
+        debug!("Publishing will message for client: {:?}", client_id);
         let message = Event::PublishWill((client_id, tenant_id));
         // is this connection_id really correct at this point?
         // as we have disconnected already, some other connection
         // might be using this connection ID!
         // It won't matter in this case as we don't use it
         // but might affect logs?
-        router_tx.send((connection_id, message)).ok();
+        router_tx.send((connection_id, message))?;
     }
+
+    Ok(())
 }
