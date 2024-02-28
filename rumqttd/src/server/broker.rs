@@ -33,7 +33,7 @@ use crate::link::console::ConsoleLink;
 use crate::link::local::{self, LinkRx, LinkTx};
 use crate::link::network::{N, Network};
 use crate::link::remote::{self, mqtt_connect, RemoteLink};
-use crate::local::{LinkBuilder, LinkError};
+use crate::local::LinkBuilder;
 use crate::protocol::{Packet, Protocol};
 use crate::protocol::v4::V4;
 use crate::protocol::v5::V5;
@@ -61,6 +61,8 @@ pub enum Error {
     Remote(#[from] remote::Error),
     #[error("Invalid configuration")]
     Config(String),
+    #[error("Lock acquisition timeout")]
+    LockAcquireTimeout,
 }
 
 pub struct Broker {
@@ -543,7 +545,7 @@ async fn remote<P: Protocol>(
 
     if let Some(sender) = will_handlers
         .try_lock_for(TIMEOUT_DURATION)
-        .ok_or(LinkError::LockAcquireTimeout)?
+        .ok_or(Error::LockAcquireTimeout)?
         .remove(&client_id)
     {
         let awaiting_will = if clean_session {
@@ -557,7 +559,7 @@ async fn remote<P: Protocol>(
     let (will_tx, will_rx) = flume::bounded::<AwaitingWill>(1);
     will_handlers
         .try_lock_for(TIMEOUT_DURATION)
-        .ok_or(LinkError::LockAcquireTimeout)?
+        .ok_or(Error::LockAcquireTimeout)?
         .insert(client_id.clone(), will_tx);
 
     // Start the link
@@ -614,7 +616,7 @@ async fn remote<P: Protocol>(
             // no need to keep the sender after timeout
             will_handlers
                 .try_lock_for(TIMEOUT_DURATION)
-                .ok_or_else(|| anyhow::anyhow!("Failed to acquire lock for will handlers"))?
+                .ok_or(Error::LockAcquireTimeout)?
                 .remove(&client_id);
             // as will delay interval has passed, publish the will message
             true
