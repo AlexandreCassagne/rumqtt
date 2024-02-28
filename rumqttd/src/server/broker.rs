@@ -33,7 +33,7 @@ use crate::link::console::ConsoleLink;
 use crate::link::local::{self, LinkRx, LinkTx};
 use crate::link::network::{N, Network};
 use crate::link::remote::{self, mqtt_connect, RemoteLink};
-use crate::local::LinkBuilder;
+use crate::local::{LinkBuilder, LinkError};
 use crate::protocol::{Packet, Protocol};
 use crate::protocol::v4::V4;
 use crate::protocol::v5::V5;
@@ -424,7 +424,7 @@ impl<P: Protocol + Clone + Send + 'static> Server<P> {
 
             let protocol = self.protocol.clone();
 
-            match link_type {
+            let created_jh = match link_type {
                 #[cfg(feature = "websocket")]
                 LinkType::Websocket => {
                     let stream = match accept_hdr_async(network, WSCallback).await {
@@ -447,8 +447,7 @@ impl<P: Protocol + Clone + Send + 'static> Server<P> {
                             "websocket_link",
                             client_id = field::Empty,
                             connection_id = field::Empty
-                        ))
-                        .map_err(|err| anyhow::anyhow!("Websocket remote link error: {:?}", err)),
+                        )),
                     )
                 }
                 LinkType::Remote => task::spawn(
@@ -465,10 +464,17 @@ impl<P: Protocol + Clone + Send + 'static> Server<P> {
                         ?tenant_id,
                         client_id = field::Empty,
                         connection_id = field::Empty,
-                    ))
-                    .map_err(|err| anyhow::anyhow!("Remote link error: {:?}", err)),
+                    )),
                 ),
             };
+
+            tokio::task::spawn(async move {
+                match created_jh.await {
+                    Ok(Ok(_)) => debug!("Remote link stopped gracefully"),
+                    Ok(Err(e)) => error!(error=?e, "Remote link error"),
+                    Err(e) => error!(error=?e, "Remote link join error"),
+                }
+            });
 
             time::sleep(delay).await;
         }
@@ -506,7 +512,7 @@ async fn remote<P: Protocol>(
     stream: Box<dyn N>,
     protocol: P,
     will_handlers: Arc<Mutex<HashMap<String, Sender<AwaitingWill>>>>,
-) -> anyhow::Result<()> {
+) -> Result<(), Error> {
     info!("Remote connection started for tenant={:?}", tenant_id);
     let mut network = Network::new(
         stream,
@@ -517,15 +523,7 @@ async fn remote<P: Protocol>(
 
     let dynamic_filters = config.dynamic_filters;
 
-    let connect_packet = match mqtt_connect(config, &mut network).await {
-        Ok(p) => p,
-        Err(e) => {
-            return Err(anyhow::anyhow!(
-                "Error while handling MQTT connect packet: {:?}",
-                e
-            ));
-        }
-    };
+    let connect_packet = mqtt_connect(config, &mut network).await?;
 
     let (mut client_id, clean_session) = match &connect_packet {
         Packet::Connect(ref connect, _, _, _, _) => {
@@ -545,7 +543,7 @@ async fn remote<P: Protocol>(
 
     if let Some(sender) = will_handlers
         .try_lock_for(TIMEOUT_DURATION)
-        .ok_or_else(|| anyhow::anyhow!("Failed to acquire lock for will handlers"))?
+        .ok_or(LinkError::LockAcquireTimeout)?
         .remove(&client_id)
     {
         let awaiting_will = if clean_session {
@@ -559,25 +557,18 @@ async fn remote<P: Protocol>(
     let (will_tx, will_rx) = flume::bounded::<AwaitingWill>(1);
     will_handlers
         .try_lock_for(TIMEOUT_DURATION)
-        .ok_or_else(|| anyhow::anyhow!("Failed to acquire lock for will handlers"))?
+        .ok_or(LinkError::LockAcquireTimeout)?
         .insert(client_id.clone(), will_tx);
 
     // Start the link
-    let remote_link = RemoteLink::new(
+    let mut link = RemoteLink::new(
         router_tx.clone(),
         tenant_id.clone(),
         network,
         connect_packet,
         dynamic_filters,
     )
-    .await;
-
-    let mut link = match remote_link {
-        Ok(l) => l,
-        Err(e) => {
-            return Err(anyhow::anyhow!("Remote link error: {:?}", e));
-        }
-    };
+    .await?;
 
     let connection_id = link.connection_id;
     let will_delay_interval = link.will_delay_interval;
