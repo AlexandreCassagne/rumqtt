@@ -1851,7 +1851,6 @@ dependencies = [
 name = "rumqttd"
 version = "0.19.0"
 dependencies = [
- "anyhow",
  "async-tungstenite",
  "axum",
  "bytes",
