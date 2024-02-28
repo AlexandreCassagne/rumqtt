@@ -1,20 +1,21 @@
+use std::cmp::min;
+use std::collections::VecDeque;
+use std::io;
+use std::sync::Arc;
+use std::time::Duration;
+
+use flume::{RecvError, Sender, SendError, TrySendError};
+use tokio::{select, time};
+use tokio::time::error::Elapsed;
+use tracing::{Span, trace};
+
+use crate::{ConnectionId, ConnectionSettings};
 use crate::link::local::{LinkError, LinkRx, LinkTx};
 use crate::link::network;
 use crate::link::network::Network;
 use crate::local::LinkBuilder;
 use crate::protocol::{Connect, Login, Packet, Protocol};
 use crate::router::{Event, Notification};
-use crate::{ConnectionId, ConnectionSettings};
-
-use flume::{RecvError, SendError, Sender, TrySendError};
-use std::cmp::min;
-use std::collections::VecDeque;
-use std::io;
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::time::error::Elapsed;
-use tokio::{select, time};
-use tracing::{trace, Span};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -128,7 +129,7 @@ impl<P: Protocol> RemoteLink<P> {
                 o = self.network.read() => {
                     let packet = o?;
                     let len = {
-                        let mut buffer = self.link_tx.buffer();
+                        let mut buffer = self.link_tx.buffer()?;
                         buffer.push_back(packet);
                         self.network.readv(&mut buffer)?;
                         buffer.len()
@@ -260,7 +261,7 @@ fn handle_auth(
 mod tests {
     use std::{collections::HashMap, sync::Arc};
 
-    use crate::{protocol::Login, ConnectionSettings};
+    use crate::{ConnectionSettings, protocol::Login};
 
     use super::handle_auth;
 

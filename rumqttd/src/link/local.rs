@@ -1,21 +1,24 @@
-use crate::protocol::{
-    Filter, LastWill, LastWillProperties, Packet, Publish, QoS, RetainForwardRule, Subscribe,
-};
-use crate::router::Ack;
-use crate::router::{
-    iobufs::{Incoming, Outgoing},
-    Connection, Event, Notification, ShadowRequest,
-};
-use crate::ConnectionId;
-use bytes::Bytes;
-use flume::{Receiver, RecvError, RecvTimeoutError, SendError, Sender, TrySendError};
-use parking_lot::lock_api::MutexGuard;
-use parking_lot::{Mutex, RawMutex};
-
 use std::collections::VecDeque;
 use std::mem;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+use bytes::Bytes;
+use flume::{Receiver, RecvError, RecvTimeoutError, Sender, SendError, TrySendError};
+use parking_lot::{Mutex, RawMutex};
+use parking_lot::lock_api::MutexGuard;
+
+use crate::ConnectionId;
+use crate::protocol::{
+    Filter, LastWill, LastWillProperties, Packet, Publish, QoS, RetainForwardRule, Subscribe,
+};
+use crate::router::{
+    Connection,
+    Event, iobufs::{Incoming, Outgoing}, Notification, ShadowRequest,
+};
+use crate::router::Ack;
+
+const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, thiserror::Error)]
 pub enum LinkError {
@@ -33,6 +36,8 @@ pub enum LinkError {
     RecvTimeout(#[from] RecvTimeoutError),
     #[error("Timeout = {0}")]
     Elapsed(#[from] tokio::time::error::Elapsed),
+    #[error("Lock acquire timeout")]
+    LockAcquireTimeout,
 }
 
 // used to build LinkTx and LinkRx
@@ -124,7 +129,11 @@ impl<'a> LinkBuilder<'a> {
         self.router_tx.send((0, event))?;
 
         link_rx.recv()?;
-        let notification = outgoing_data_buffer.lock().pop_front().unwrap();
+        let notification = outgoing_data_buffer
+            .try_lock_for(LOCK_TIMEOUT)
+            .ok_or(LinkError::LockAcquireTimeout)?
+            .pop_front()
+            .unwrap();
 
         // Right now link identifies failure with dropped rx in router,
         // which is probably ok. We need this here to get id assigned by router
@@ -158,14 +167,15 @@ impl LinkTx {
         }
     }
 
-    pub fn buffer(&self) -> MutexGuard<RawMutex, VecDeque<Packet>> {
-        self.recv_buffer.lock()
+    pub fn buffer(&mut self) -> Result<MutexGuard<RawMutex, VecDeque<Packet>>, LinkError> {
+        // self.recv_buffer.lock()
+        self.acquire_receive_buffer_lock()
     }
 
     /// Send raw device data
     fn push(&mut self, data: Packet) -> Result<usize, LinkError> {
         let len = {
-            let mut buffer = self.recv_buffer.lock();
+            let mut buffer = self.acquire_receive_buffer_lock()?;
             buffer.push_back(data);
             buffer.len()
         };
@@ -179,7 +189,8 @@ impl LinkTx {
     /// Send raw device data
     pub async fn send(&mut self, data: Packet) -> Result<usize, LinkError> {
         let len = {
-            let mut buffer = self.recv_buffer.lock();
+            let mutex_guard = self.acquire_receive_buffer_lock()?;
+            let mut buffer = mutex_guard;
             buffer.push_back(data);
             buffer.len()
         };
@@ -190,9 +201,18 @@ impl LinkTx {
         Ok(len)
     }
 
+    fn acquire_receive_buffer_lock(
+        &mut self,
+    ) -> Result<MutexGuard<RawMutex, VecDeque<Packet>>, LinkError> {
+        self.recv_buffer
+            .try_lock_for(LOCK_TIMEOUT)
+            .ok_or(LinkError::LockAcquireTimeout)
+    }
+
     fn try_push(&mut self, data: Packet) -> Result<usize, LinkError> {
         let len = {
-            let mut buffer = self.recv_buffer.lock();
+            // let mut buffer = self.recv_buffer.lock();
+            let mut buffer = self.acquire_receive_buffer_lock()?;
             buffer.push_back(data);
             buffer.len()
         };
@@ -332,7 +352,8 @@ impl LinkRx {
                 self.router_rx.recv()?;
                 // Collect 'all' the data in the buffer after a notification.
                 // Notification means fresh data which isn't previously collected
-                mem::swap(&mut *self.send_buffer.lock(), &mut self.cache);
+                let mut mutex_guard = Self::acquire_lock_with_timeout(&mut self.send_buffer)?;
+                mem::swap(&mut *mutex_guard, &mut self.cache);
                 Ok(self.cache.pop_front())
             }
         }
@@ -347,7 +368,8 @@ impl LinkRx {
             None => {
                 // If cache is empty, check for router trigger and get fresh notifications
                 self.router_rx.recv_deadline(deadline)?;
-                mem::swap(&mut *self.send_buffer.lock(), &mut self.cache);
+                let mut mutex_guard = Self::acquire_lock_with_timeout(&mut self.send_buffer)?;
+                mem::swap(&mut *mutex_guard, &mut self.cache);
                 Ok(self.cache.pop_front())
             }
         }
@@ -364,7 +386,12 @@ impl LinkRx {
                 self.router_rx.recv_async().await?;
                 // Collect 'all' the data in the buffer after a notification.
                 // Notification means fresh data which isn't previously collected
-                mem::swap(&mut *self.send_buffer.lock(), &mut self.cache);
+                let mut mutex_guard = self
+                    .send_buffer
+                    .try_lock_for(LOCK_TIMEOUT)
+                    .ok_or(LinkError::LockAcquireTimeout)?;
+
+                mem::swap(&mut *mutex_guard, &mut self.cache);
                 Ok(self.cache.pop_front())
             }
         }
@@ -375,8 +402,18 @@ impl LinkRx {
         notifications: &mut VecDeque<Notification>,
     ) -> Result<(), LinkError> {
         self.router_rx.recv_async().await?;
-        mem::swap(&mut *self.send_buffer.lock(), notifications);
+
+        let mut mutex_guard = Self::acquire_lock_with_timeout(&mut self.send_buffer)?;
+        mem::swap(&mut *mutex_guard, notifications);
         Ok(())
+    }
+
+    fn acquire_lock_with_timeout<T>(
+        mutex: &mut Arc<parking_lot::lock_api::Mutex<RawMutex, VecDeque<T>>>,
+    ) -> Result<MutexGuard<RawMutex, VecDeque<T>>, LinkError> {
+        mutex
+            .try_lock_for(LOCK_TIMEOUT)
+            .ok_or(LinkError::LockAcquireTimeout)
     }
 
     pub fn ready(&self) -> Result<(), LinkError> {
@@ -395,10 +432,12 @@ impl LinkRx {
 
 #[cfg(test)]
 mod test {
-    use super::LinkTx;
+    use std::{collections::VecDeque, sync::Arc, thread};
+
     use flume::bounded;
     use parking_lot::Mutex;
-    use std::{collections::VecDeque, sync::Arc, thread};
+
+    use super::LinkTx;
 
     #[test]
     fn push_sends_all_data_and_notifications_to_router() {
