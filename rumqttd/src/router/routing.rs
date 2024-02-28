@@ -1,34 +1,36 @@
-use crate::protocol::{
-    ConnAck, ConnAckProperties, ConnectReturnCode, Disconnect, DisconnectReasonCode, LastWill,
-    LastWillProperties, Packet, PingResp, PubAck, PubAckReason, PubComp, PubCompReason, PubRec,
-    PubRecReason, PubRel, PubRelReason, Publish, PublishProperties, QoS, SubAck,
-    SubscribeReasonCode, UnsubAck, UnsubAckReason,
-};
-use crate::router::alertlog::alert;
-use crate::router::graveyard::SavedState;
-use crate::router::scheduler::{PauseReason, Tracker};
-use crate::router::Forward;
-use crate::segments::Position;
-use crate::*;
-use flume::{bounded, Receiver, RecvError, Sender, TryRecvError};
-use slab::Slab;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::str::Utf8Error;
 use std::thread;
 use std::time::SystemTime;
+
+use flume::{bounded, Receiver, RecvError, Sender, TryRecvError};
+use slab::Slab;
 use thiserror::Error;
 use tracing::{debug, error, info, trace, warn};
 
+use crate::*;
+use crate::protocol::{
+    ConnAck, ConnAckProperties, ConnectReturnCode, Disconnect, DisconnectReasonCode, LastWill,
+    LastWillProperties, Packet, PingResp, PubAck, PubAckReason, PubComp, PubCompReason, Publish,
+    PublishProperties, PubRec, PubRecReason, PubRel, PubRelReason, QoS, SubAck,
+    SubscribeReasonCode, UnsubAck, UnsubAckReason,
+};
+use crate::router::alertlog::alert;
+use crate::router::Forward;
+use crate::router::graveyard::SavedState;
+use crate::router::scheduler::{PauseReason, Tracker};
+use crate::segments::Position;
+
+use super::{
+    Connection, DataRequest, Event, FilterIdx, MAX_CHANNEL_CAPACITY, MAX_SCHEDULE_ITERATIONS, Meter, Notification, packetid,
+    Print, RouterMeter, ShadowRequest,
+};
 use super::alertlog::{Alert, AlertLog};
 use super::graveyard::Graveyard;
 use super::iobufs::{Incoming, Outgoing};
 use super::logs::{AckLog, DataLog};
-use super::scheduler::{ScheduleReason, Scheduler};
+use super::scheduler::{Scheduler, ScheduleReason};
 use super::shared_subs::SharedGroup;
-use super::{
-    packetid, Connection, DataRequest, Event, FilterIdx, Meter, Notification, Print, RouterMeter,
-    ShadowRequest, MAX_CHANNEL_CAPACITY, MAX_SCHEDULE_ITERATIONS,
-};
 
 #[derive(Error, Debug)]
 pub enum RouterError {
@@ -435,6 +437,7 @@ impl Router {
                 .lock()
                 .push_back(disconnect_notification);
 
+            // FIXME: Why is it ok to ignore this result?
             outgoing.handle.try_send(()).ok();
         }
 
@@ -1381,6 +1384,8 @@ fn ack_device_data(ackslog: &mut AckLog, outgoing: &mut Outgoing) -> bool {
     }
 
     debug!(acks_count = count, "Acks sent to device");
+
+    // FIXME: Why is it ok to ignore this result?
     outgoing.handle.try_send(()).ok();
     true
 }
@@ -1596,10 +1601,12 @@ fn forward_device_data(
     if len >= MAX_CHANNEL_CAPACITY - 1 {
         debug!("Outgoing channel reached its capacity");
         outgoing.push_notification(Notification::Unschedule);
+        // FIXME: Why is it ok to ignore this result?
         outgoing.handle.try_send(()).ok();
         return ConsumeStatus::BufferFull;
     }
 
+    // FIXME: Why is it ok to ignore this result?
     outgoing.handle.try_send(()).ok();
 
     // update the state of shared subscription
@@ -1630,6 +1637,7 @@ fn retrieve_shadow(datalog: &mut DataLog, outgoing: &mut Outgoing, shadow: Shado
         if len >= MAX_CHANNEL_CAPACITY - 1 {
             outgoing.push_notification(Notification::Unschedule);
         }
+        // FIXME: Why is it ok to ignore this result?
         outgoing.handle.try_send(()).ok();
     }
 }
