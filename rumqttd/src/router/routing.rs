@@ -1,9 +1,11 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::str::Utf8Error;
 use std::thread;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use flume::{bounded, Receiver, RecvError, Sender, TryRecvError};
+use parking_lot::lock_api::MutexGuard;
+use parking_lot::RawMutex;
 use slab::Slab;
 use thiserror::Error;
 use tracing::{debug, error, info, trace, warn};
@@ -53,10 +55,14 @@ pub enum RouterError {
     InvalidClientId(String),
     #[error("Disconnection (Reason: {0:?})")]
     Disconnect(DisconnectReasonCode),
+    #[error("Lock acquire timeout")]
+    LockAcquireTimeout,
 }
 
 // TODO: set this to some appropriate value
 const TOPIC_ALIAS_MAX: u16 = 4096;
+
+const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct Router {
     id: RouterId,
@@ -432,13 +438,23 @@ impl Router {
 
             let disconnect_notification = Notification::Disconnect(disconnect, None);
 
-            outgoing
+            let data_buffer = outgoing
                 .data_buffer
-                .lock()
-                .push_back(disconnect_notification);
+                .try_lock_for(LOCK_TIMEOUT)
+                .ok_or(RouterError::LockAcquireTimeout);
 
-            // FIXME: Why is it ok to ignore this result?
-            outgoing.handle.try_send(()).ok();
+            match data_buffer {
+                Ok(mut data_buffer) => {
+                    data_buffer.push_back(disconnect_notification);
+
+                    // FIXME: Why is it ok to ignore this result?
+                    outgoing.handle.try_send(()).ok();
+                }
+                Err(e) => {
+                    error!("Failed to acquire lock for data buffer: {}", e);
+                }
+            }
+
         }
 
         // Remove connection from router
@@ -1371,7 +1387,9 @@ fn ack_device_data(ackslog: &mut AckLog, outgoing: &mut Outgoing) -> bool {
     }
 
     let mut count = 0;
-    let mut buffer = outgoing.data_buffer.lock();
+    let mut buffer = outgoing.data_buffer.try_lock_for(LOCK_TIMEOUT)
+        .ok_or(RouterError::LockAcquireTimeout)
+        .unwrap();
 
     // Unlike forwards, we are reading all the pending acks for a given connection.
     // At any given point of time, there can be a max of connection's buffer size

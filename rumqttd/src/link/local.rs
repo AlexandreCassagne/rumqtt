@@ -17,8 +17,8 @@ use crate::router::{
     Event, iobufs::{Incoming, Outgoing}, Notification, ShadowRequest,
 };
 use crate::router::Ack;
-
 const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
+
 
 #[derive(Debug, thiserror::Error)]
 pub enum LinkError {

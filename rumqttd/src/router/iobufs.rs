@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, VecDeque},
     sync::Arc,
 };
+use std::time::Duration;
 
 use flume::{Receiver, Sender};
 use parking_lot::Mutex;
@@ -17,6 +18,8 @@ use super::{Forward, IncomingMeter, OutgoingMeter};
 
 const MAX_INFLIGHT: usize = 100;
 const MAX_PKID: u16 = MAX_INFLIGHT as u16;
+
+const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug)]
 pub struct Incoming {
@@ -45,7 +48,13 @@ impl Incoming {
 
     #[inline]
     pub(crate) fn exchange(&mut self, mut v: VecDeque<Packet>) -> VecDeque<Packet> {
-        std::mem::swap(&mut v, &mut self.buffer.lock());
+        let mut buffer = self.buffer.try_lock_for(LOCK_TIMEOUT).unwrap_or_else(|| {
+            panic!(
+                "Failed to acquire lock on incoming buffer in `exchange` for client_id: {}",
+                self.client_id
+            )
+        });
+        std::mem::swap(&mut v, &mut buffer);
         v
     }
 }
@@ -103,7 +112,12 @@ impl Outgoing {
     }
 
     pub fn push_notification(&mut self, notification: Notification) -> usize {
-        let mut buffer = self.data_buffer.lock();
+        let mut buffer = self.data_buffer.try_lock_for(LOCK_TIMEOUT).unwrap_or_else(|| {
+            panic!(
+                "Failed to acquire lock on outgoing buffer in `push_notification` for client_id: {}",
+                self.client_id
+            )
+        });
         buffer.push_back(notification);
         buffer.len()
     }
@@ -115,7 +129,14 @@ impl Outgoing {
         qos: u8,
         filter_idx: usize,
     ) -> (usize, usize) {
-        let mut buffer = self.data_buffer.lock();
+        let mut buffer = self.data_buffer
+            .try_lock_for(LOCK_TIMEOUT)
+            .unwrap_or_else(|| {
+                panic!(
+                    "Failed to acquire lock in `push_forward` on outgoing buffer for client_id: {}",
+                    self.client_id
+                )
+            });
         let publishes = publishes;
 
         if qos == 0 {
